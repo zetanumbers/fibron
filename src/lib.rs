@@ -1,12 +1,14 @@
 use std::num::NonZero;
 
+const DEFAULT_STACK_SIZE: usize = 1024 * 1024;
+
 pub struct ThreadPoolBuilder {
     get_thread_name: Option<Box<dyn FnMut(usize) -> String>>,
     acquire_thread_handler: Option<Box<dyn Fn() + Send + Sync>>,
     release_thread_handler: Option<Box<dyn Fn() + Send + Sync>>,
     num_threads: Option<NonZero<usize>>,
     deadlock_handler: Option<Box<dyn Fn() + Send + Sync>>,
-    stack_size: Option<usize>,
+    stack_size: usize,
 }
 
 impl ThreadPoolBuilder {
@@ -17,7 +19,7 @@ impl ThreadPoolBuilder {
             release_thread_handler: None,
             num_threads: None,
             deadlock_handler: None,
-            stack_size: None,
+            stack_size: DEFAULT_STACK_SIZE,
         }
     }
 
@@ -59,7 +61,7 @@ impl ThreadPoolBuilder {
     }
 
     pub fn stack_size(mut self, stack_size: usize) -> Self {
-        self.stack_size = Some(stack_size);
+        self.stack_size = stack_size;
         self
     }
 }
