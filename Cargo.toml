@@ -4,4 +4,4 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-corosensei = "0.1.4"
+corosensei = { version = "0.2.1", git = "https://github.com/zetanumbers/corosensei.git", branch = "fiber" }
