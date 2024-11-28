@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 corosensei = { version = "0.2.1", git = "https://github.com/zetanumbers/corosensei.git", branch = "fiber" }
+crossbeam-deque = "0.8.5"
+flume = "0.11.1"
