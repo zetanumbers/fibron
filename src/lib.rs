@@ -1,16 +1,20 @@
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
+    convert::Infallible,
+    future::{Future, IntoFuture},
     io,
     mem::transmute,
     num::NonZero,
+    pin::pin,
     ptr,
     sync::{mpsc, Arc, Mutex},
-    task::{self, Waker},
+    task::{self, Poll},
     thread,
 };
 
-use corosensei::Fiber;
+use corosensei::{fiber, Fiber};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use futures_lite::future::block_on;
 
 const DEFAULT_STACK_SIZE: usize = 1024 * 1024;
 const DEFAULT_FALLBACK_NUM_THREADS: usize = 4;
@@ -87,19 +91,19 @@ impl ThreadPoolBuilder {
             .map(NonZero::get)
             .unwrap_or(DEFAULT_FALLBACK_NUM_THREADS);
         let (threads, workers): (Vec<_>, Vec<_>) = (0..num_threads)
-            .map(|_| {
+            .map(|thrd_idx| {
                 let worker = Worker::new_lifo();
-                let (tx, rx) = mpsc::channel
+                let (tx, rx) = mpsc::channel();
                 (
                     ThreadInfo {
                         stealer: worker.stealer(),
                     },
                     WorkerThread {
+                        thrd_idx,
                         lifo_queue: worker,
-                        current_fiber_waker: todo!(),
-                        free_fibers: Vec::new(),
-                        fiber_in_queue: todo!(),
-                        fiber_out_queue: todo!(),
+                        free_fibers: RefCell::new(Vec::new()),
+                        fiber_queue_out: rx,
+                        fiber_queue_in: tx,
                     },
                 )
             })
@@ -118,7 +122,10 @@ impl ThreadPoolBuilder {
                     .name(format!("fibron_thread_{i}"))
                     .spawn({
                         let r = Arc::clone(&registry);
-                        move || main_loop(i, &r, &worker)
+                        move || {
+                            WorkerThread::set_current(&worker);
+                            main_loop(&r, &worker)
+                        }
                     })
                 {
                     // FIXME: terminate threads
@@ -131,9 +138,29 @@ impl ThreadPoolBuilder {
 }
 
 // FIXME: use fibers
-fn main_loop(thrd_idx: usize, registry: &Registry, local: &WorkerThread) -> ! {
-    WorkerThread::set_current(local);
+fn main_loop(registry: &Registry, local: &WorkerThread) -> ! {
     loop {
+        match local.fiber_queue_out.try_recv() {
+            Ok(rx) => match rx.try_recv() {
+                Ok(fiber) => {
+                    let local = ptr::addr_of!(*local);
+                    let job =
+                        fiber.switch(move |f| unsafe { (*local).free_fibers.borrow_mut().push(f) });
+                    if let Some(job) = job {
+                        job();
+                    }
+                    continue;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    panic!("fiber queue is expected to contain receivers with received value")
+                }
+                // Fiber waker is dropped without waking, thus consider this fiber to be stuck
+                Err(mpsc::TryRecvError::Disconnected) => continue,
+            },
+            Err(mpsc::TryRecvError::Empty) => (),
+            Err(mpsc::TryRecvError::Disconnected) => panic!("fiber queue is closed"),
+        }
+
         let steal = local
             .lifo_queue
             .pop()
@@ -143,7 +170,7 @@ fn main_loop(thrd_idx: usize, registry: &Registry, local: &WorkerThread) -> ! {
                     .threads
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| *i != thrd_idx)
+                    .filter(|(i, _)| *i != local.thrd_idx)
                     .find_map(|(_, thread)| loop {
                         match thread.stealer.steal() {
                             Steal::Empty => break None,
@@ -215,13 +242,15 @@ impl ThreadPool {
         }
         let worker = unsafe { &*worker };
 
-        let (tx, rx) = mpsc::sync_channel(1);
+        // oneshot async channel
+        let (tx_b, rx_b) = flume::bounded(1);
+
         // FIXME: use `Job` trait from rayon
         // SAFETY: we do not exit the scope until `task_b` executes
         // FIXME: handle unwinding
         let task_b = unsafe {
             transmute::<Box<dyn FnOnce() + Send + '_>, Box<dyn FnOnce() + Send>>(Box::new(|| {
-                tx.try_send(oper_b()).unwrap();
+                tx_b.try_send(oper_b()).unwrap();
             }))
         };
         // NOTE: assuming box address doesn't change
@@ -233,30 +262,111 @@ impl ThreadPool {
         // let mut is_task_inaccessable = false;
         // let mut other_tasks_stack = Vec::new();
         let res_b = loop {
-            match rx.try_recv() {
+            match rx_b.try_recv() {
                 Ok(b) => break b,
-                Err(mpsc::TryRecvError::Disconnected) => unimplemented!(),
-                Err(mpsc::TryRecvError::Empty) => (),
+                Err(flume::TryRecvError::Disconnected) => todo!("endless task"),
+                Err(flume::TryRecvError::Empty) => (),
             }
 
-            // if !is_task_inaccessable {
-            if let Some(task) = worker.lifo_queue.pop() {
-                if ptr::eq(&*task, addr_b) {
-                task();
+            let mut task = worker.lifo_queue.pop();
+            if let Some(t) = task.take() {
+                if ptr::eq(&*t, addr_b) {
+                    t();
+                    continue;
                 } else {
-                //     other_tasks_stack.push(task);
+                    task = Some(t);
                 }
-            } else {
-                // is_task_inaccessable = true
             }
-            // }
+
+            let mut rx_b = pin!(rx_b.into_recv_async());
+            let (tx, rx) = mpsc::sync_channel(1);
+            let waker = Arc::new(FiberWaker {
+                tx: worker.fiber_queue_in.clone(),
+                rx: Mutex::new(Some(rx)),
+            })
+            .into();
+            let mut cx = task::Context::from_waker(&waker);
+
+            break loop {
+                let task = task.take();
+
+                if let Poll::Ready(res_b) = rx_b.as_mut().poll(&mut cx) {
+                    match res_b {
+                        Ok(b) => break b,
+                        Err(flume::RecvError::Disconnected) => todo!("endless task"),
+                    }
+                }
+
+                let tx = tx.clone();
+                let free_fiber = worker.free_fibers.borrow_mut().pop();
+                let worker = ptr::addr_of!(*worker);
+                match free_fiber {
+                    Some(f) => f.switch(move |f| {
+                        tx.try_send(f).unwrap();
+                        task
+                    }),
+                    None => {
+                        let registry = Arc::clone(&self.registry);
+
+                        fiber::<Infallible>().switch(move |f| {
+                            tx.try_send(f).unwrap();
+                            if let Some(task) = task {
+                                task();
+                            }
+                            main_loop(&registry, unsafe { &*worker })
+                        });
+                    }
+                };
+            };
         };
 
-        // for other_task in other_tasks_stack {
-        //     worker.lifo_queue.push(other_task);
-        // }
-
         (res_a, res_b)
+    }
+
+    pub fn wait_for<F>(&self, fut: F) -> F::Output
+    where
+        F: IntoFuture,
+    {
+        let fut = fut.into_future();
+        let worker = WorkerThread::current();
+        if worker.is_null() {
+            return block_on(fut);
+        }
+        let worker = unsafe { &*worker };
+
+        let mut fut = pin!(fut);
+        let (tx, rx) = mpsc::sync_channel(1);
+        let waker = Arc::new(FiberWaker {
+            tx: worker.fiber_queue_in.clone(),
+            rx: Mutex::new(Some(rx)),
+        })
+        .into();
+        let mut cx = task::Context::from_waker(&waker);
+
+        loop {
+            // TODO: allow to poll on other fibers
+            if let Poll::Ready(res_b) = fut.as_mut().poll(&mut cx) {
+                return res_b;
+            }
+
+            let tx = tx.clone();
+            let free_fiber = worker.free_fibers.borrow_mut().pop();
+            match free_fiber {
+                Some(f) => f.switch(move |f| {
+                    tx.try_send(f).unwrap();
+                    None
+                }),
+                None => {
+                    let registry = Arc::clone(&self.registry);
+                    let worker = ptr::addr_of!(*worker);
+
+                    fiber::<Infallible>().switch(move |f| {
+                        tx.try_send(f).unwrap();
+                        main_loop(&registry, unsafe { &*worker })
+                    });
+                }
+            };
+        }
     }
 }
 
@@ -264,19 +374,15 @@ struct ThreadInfo {
     stealer: Stealer<Job>,
 }
 
-impl ThreadInfo {
-    fn new(stealer: Stealer<Job>) -> Self {
-        Self { stealer }
-    }
+struct WorkerThread {
+    thrd_idx: usize,
+    lifo_queue: Worker<Job>,
+    free_fibers: RefCell<Vec<Fiber<Option<Job>>>>,
+    fiber_queue_out: mpsc::Receiver<mpsc::Receiver<Fiber<()>>>,
+    fiber_queue_in: mpsc::Sender<mpsc::Receiver<Fiber<()>>>,
 }
 
-struct WorkerThread {
-    lifo_queue: Worker<Job>,
-    current_fiber_waker: Waker,
-    free_fibers: Vec<Fiber<Option<Job>>>,
-    fiber_in_queue: mpsc::Receiver<mpsc::Receiver<Fiber<()>>>,
-    fiber_out_queue: mpsc::Sender<Fiber<()>>,
-}
+unsafe impl Send for WorkerThread {}
 
 impl WorkerThread {
     fn current() -> *const WorkerThread {
@@ -295,35 +401,22 @@ thread_local! {
     static WORKER_THREAD_STATE: Cell<*const WorkerThread> = const { Cell::new(ptr::null()) };
 }
 
-// TODO: proper waker implementation
-struct FiberWakerState {
-    tx: mpsc::Sender<mpsc::Receiver<Fiber<()>>>,
-    rx: Option<mpsc::Receiver<Fiber<()>>>,
-}
-
 struct FiberWaker {
-    state: Mutex<FiberWakerState>,
+    tx: mpsc::Sender<mpsc::Receiver<Fiber<()>>>,
+    rx: Mutex<Option<mpsc::Receiver<Fiber<()>>>>,
 }
 
-impl FiberWaker {
-    fn new(
-        tx: mpsc::Sender<mpsc::Receiver<Fiber<()>>>,
-        rx: mpsc::Receiver<Fiber<()>>,
-    ) -> Self {
-        Self {
-            state: Mutex::new(FiberWakerState { tx, rx: Some(rx) }),
-        }
-    }
-}
+unsafe impl Sync for FiberWaker {}
+unsafe impl Send for FiberWaker {}
 
 impl task::Wake for FiberWaker {
     fn wake(self: Arc<Self>) {
-        let Ok(mut state) = self.state.lock() else {
+        let Ok(mut rx) = self.rx.lock() else {
             return;
         };
-        let Some(rx) = state.rx.take() else {
+        let Some(rx) = rx.take() else {
             return;
         };
-        let _ = state.tx.send(rx);
+        let _ = self.tx.send(rx);
     }
 }

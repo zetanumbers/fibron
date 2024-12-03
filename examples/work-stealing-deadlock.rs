@@ -18,10 +18,14 @@ fn main() {
                 || {
                     println!("task 1 START, thread_id: {:?}", std::thread::current());
                     sleep(Duration::from_secs(1));
-                    thread_pool.spawn(move || {
-                        println!("task 3 START, thread_id: {:?}", std::thread::current());
-                        rx1.recv().unwrap();
-                        println!("task 3 DONE");
+                    thread_pool.spawn({
+                        let thread_pool = Arc::clone(&thread_pool);
+                        move || {
+                            println!("task 3 START, thread_id: {:?}", std::thread::current());
+                            // this is there async comes in:
+                            thread_pool.wait_for(rx1.into_recv_async()).unwrap();
+                            println!("task 3 DONE");
+                        }
                     });
                     println!("task 1 DONE");
                 },
